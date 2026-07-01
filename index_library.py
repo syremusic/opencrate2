@@ -12,7 +12,7 @@ current batch then stops cleanly.
 
 Outputs (in --out dir):
     embeddings.f32   raw normalized float32 vectors, appended as we go
-    manifest.jsonl   one JSON record per vector (path + metadata)
+    paths.txt        one audio file path per vector (parallel to embeddings)
     bad.txt          files that failed to read/embed
     index.faiss      the final searchable index (built at the end)
 """
@@ -24,7 +24,6 @@ import torch
 import faiss
 
 import argparse
-import json
 import os
 import signal
 import sys
@@ -38,7 +37,7 @@ from tqdm import tqdm
 from engine import (
     DIM,
     EMB_FILE,
-    MANIFEST,
+    PATHS_FILE,
     BAD_FILE,
     INDEX_FILE,
     AUDIO_EXTS,
@@ -72,13 +71,13 @@ def scan_audio(root: Path):
                 yield Path(dirpath) / name
 
 
-def header_info(path: Path) -> tuple[float, int] | None:
-    """Read duration + sample rate from the header only (fast, no decode)."""
+def duration_of(path: Path) -> float | None:
+    """Read duration from the header only (fast, no decode). None if unreadable."""
     try:
         info = sf.info(str(path))
         if info.samplerate <= 0 or info.frames <= 0:
             return None
-        return info.frames / info.samplerate, info.samplerate
+        return info.frames / info.samplerate
     except Exception:
         return None
 
@@ -92,36 +91,34 @@ def _count_lines(p: Path) -> int:
     return sum(1 for _ in p.open()) if p.exists() else 0
 
 
-def repair(emb_f: Path, man_f: Path) -> None:
-    """Trim embeddings.f32 / manifest.jsonl to the same length after a crash."""
-    n_emb, n_man = _rows_in_bin(emb_f), _count_lines(man_f)
-    keep = min(n_emb, n_man)
+def repair(emb_f: Path, paths_f: Path) -> None:
+    """Trim embeddings.f32 / paths.txt to the same length after a crash."""
+    n_emb, n_paths = _rows_in_bin(emb_f), _count_lines(paths_f)
+    keep = min(n_emb, n_paths)
     if n_emb > keep:
         with emb_f.open("r+b") as fh:
             fh.truncate(keep * DIM * 4)
-    if n_man > keep and man_f.exists():
-        lines = man_f.open().readlines()[:keep]
-        with man_f.open("w") as fh:
+    if n_paths > keep and paths_f.exists():
+        lines = paths_f.open().readlines()[:keep]
+        with paths_f.open("w") as fh:
             fh.writelines(lines)
 
 
-def load_set(p: Path, key: str | None = None) -> set[str]:
+def load_set(p: Path) -> set[str]:
     if not p.exists():
         return set()
-    if key is None:
-        return {line.strip() for line in p.open() if line.strip()}
-    return {json.loads(line)[key] for line in p.open() if line.strip()}
+    return {line.strip() for line in p.open() if line.strip()}
 
 
 # ───────── append ─────────────────────────────────────────────────────────
-def append(emb_f: Path, man_f: Path, vecs: np.ndarray, records: list[dict]) -> None:
+def append(emb_f: Path, paths_f: Path, vecs: np.ndarray, paths: list[str]) -> None:
     with emb_f.open("ab") as fh:
         fh.write(vecs.astype("float32", copy=False).tobytes(order="C"))
         fh.flush()
         os.fsync(fh.fileno())
-    with man_f.open("a") as fh:
-        for rec in records:
-            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    with paths_f.open("a") as fh:
+        for path in paths:
+            fh.write(path + "\n")
         fh.flush()
         os.fsync(fh.fileno())
 
@@ -129,15 +126,15 @@ def append(emb_f: Path, man_f: Path, vecs: np.ndarray, records: list[dict]) -> N
 # ───────── build ──────────────────────────────────────────────────────────
 def build(root: Path, out: Path, batch: int) -> None:
     out.mkdir(parents=True, exist_ok=True)
-    emb_f, man_f, bad_f, idx_f = (
+    emb_f, paths_f, bad_f, idx_f = (
         out / EMB_FILE,
-        out / MANIFEST,
+        out / PATHS_FILE,
         out / BAD_FILE,
         out / INDEX_FILE,
     )
 
-    repair(emb_f, man_f)
-    done = load_set(man_f, key="path")
+    repair(emb_f, paths_f)
+    done = load_set(paths_f)
     bad = load_set(bad_f)
 
     print("Scanning files…")
@@ -146,7 +143,7 @@ def build(root: Path, out: Path, batch: int) -> None:
     if not todo:
         print("Nothing new to do.")
     else:
-        _process(todo, emb_f, man_f, bad_f, batch)
+        _process(todo, emb_f, paths_f, bad_f, batch)
 
     if _stop:
         print("🛑 Stopped by user. Re-run to resume.")
@@ -155,9 +152,8 @@ def build(root: Path, out: Path, batch: int) -> None:
     _build_faiss(emb_f, idx_f)
 
 
-def _process(todo, emb_f, man_f, bad_f, batch):
+def _process(todo, emb_f, paths_f, bad_f, batch):
     pending_paths: list[Path] = []
-    pending_meta: list[tuple[float, int]] = []
 
     def flush():
         if not pending_paths:
@@ -168,45 +164,29 @@ def _process(todo, emb_f, man_f, bad_f, batch):
             # If a whole batch fails, fall back to one-by-one so one bad
             # file doesn't poison the rest.
             print(f"Batch embed failed ({e}); retrying individually…")
-            for p, m in zip(pending_paths, pending_meta):
+            for p in pending_paths:
                 try:
                     v = embed_audio([str(p)])
-                    append(emb_f, man_f, v, [_record(p, m)])
+                    append(emb_f, paths_f, v, [str(p)])
                 except Exception:
                     with bad_f.open("a") as f:
                         f.write(str(p) + "\n")
         else:
-            records = [_record(p, m) for p, m in zip(pending_paths, pending_meta)]
-            append(emb_f, man_f, vecs, records)
+            append(emb_f, paths_f, vecs, [str(p) for p in pending_paths])
         pending_paths.clear()
-        pending_meta.clear()
 
     for p in tqdm(todo, ncols=88, desc="Embedding"):
         if _stop:
             break
-        info = header_info(p)
-        if info is None or info[0] > MAX_SECONDS:
+        dur = duration_of(p)
+        if dur is None or dur > MAX_SECONDS:
             with bad_f.open("a") as f:
                 f.write(str(p) + "\n")
             continue
         pending_paths.append(p)
-        pending_meta.append(info)
         if len(pending_paths) >= batch:
             flush()
     flush()
-
-
-def _record(p: Path, meta: tuple[float, int]) -> dict:
-    duration, samplerate = meta
-    stat = p.stat()
-    return {
-        "path": str(p),
-        "filename": p.name,
-        "bytes": stat.st_size,
-        "mtime": int(stat.st_mtime),
-        "duration": round(duration, 3),
-        "samplerate": samplerate,
-    }
 
 
 def _build_faiss(emb_f: Path, idx_f: Path) -> None:

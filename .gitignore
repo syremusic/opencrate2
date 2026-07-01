@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+build/
+dist/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# OpenCrate build artifacts
+opencrate_index/
+*.faiss
+*.f32
+
+# Model / HF cache (large, downloaded on demand)
+.cache/
+
+# OS / editor cruft
+.DS_Store
+._*
+.idea/
+.vscode/

@@ -6,5 +6,4 @@ numpy
 soundfile
 tqdm
 fastapi
-uvicorn[standard]
-python-multipart
+uvicorn
