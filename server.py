@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import threading
+from contextlib import asynccontextmanager
 from pathlib import Path
 
 from fastapi import FastAPI, HTTPException
@@ -28,20 +29,24 @@ from engine import Library, embed_text
 
 INDEX_DIR = Path(os.environ.get("OPENCRATE_INDEX", "opencrate_index"))
 
-app = FastAPI(
-    title="OpenCrate", description="Semantic search over a local sample library."
-)
-
 library: Library | None = None
 # Serialize CLAP inference so queued requests hit the model one at a time.
 _lock = threading.Lock()
 
 
-@app.on_event("startup")
-def _startup():
+@asynccontextmanager
+async def lifespan(app: FastAPI):
     global library
     library = Library(INDEX_DIR)
     print(f"Loaded {len(library):,} samples from {INDEX_DIR}")
+    yield
+
+
+app = FastAPI(
+    title="OpenCrate",
+    description="Semantic search over a local sample library.",
+    lifespan=lifespan,
+)
 
 
 class SearchRequest(BaseModel):
